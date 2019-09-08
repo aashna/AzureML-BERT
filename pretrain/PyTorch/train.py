@@ -30,6 +30,10 @@ from configuration import BertJobConfiguration
 
 from azureml.core.run import Run
 
+from apex import amp
+import amp_C
+import apex_C
+from apex.amp import _amp_state
 
 def get_effective_batch(total):
     if use_multigpu_with_single_device_per_process:
@@ -360,26 +364,10 @@ if __name__ == '__main__':
                           summary_writer = summary_writer)
 
     logger.info("Converting the input parameters")
-    if fp16:
-        model.half()
+    #if fp16:
+    #    model.half()
         
     model.to(device)
-
-    if use_multigpu_with_single_device_per_process:
-        try:
-            if accumulate_gradients:
-                logger.info("Enabling gradient accumulation by using a forked version of DistributedDataParallel implementation available in the branch bertonazureml/apex at https://www.github.com/microsoft/apex")
-                from distributed_apex import DistributedDataParallel as DDP
-            else:
-                logger.info("Using Default Apex DistributedDataParallel implementation")
-                from apex.parallel import DistributedDataParallel as DDP
-        except ImportError:
-            raise ImportError("To use distributed and fp16 training, please install apex from the branch bertonazureml/apex at https://www.github.com/microsoft/apex.")
-        torch.cuda.set_device(local_rank)
-        model.network = DDP(model.network, delay_allreduce=False)
-
-    elif n_gpu > 1:
-        model.network = nn.DataParallel(model.network)
 
     # Prepare Optimizer
     logger.info("Preparing the optimizer")
@@ -404,38 +392,63 @@ if __name__ == '__main__':
                               bias_correction=False,
                               max_grad_norm=1.0)
         if loss_scale == 0:
-            optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
+            #optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
+            model.network, optimizer = amp.initialize(model.network, optimizer, opt_level="O2", keep_batchnorm_fp32=False,
+                                              loss_scale="dynamic")
+            #model.network, optimizer = amp.initialize(model.network, optimizer, opt_level="O2", loss_scale="dynamic",
+             #                                 master_weights=False if accumulate_gradients else True)
         else:
-            optimizer = FP16_Optimizer(
-                optimizer, static_loss_scale=loss_scale)
+            #optimizer = FP16_Optimizer(optimizer, static_loss_scale=loss_scale)
+            #model.network, optimizer = amp.initialize(model.network, optimizer, opt_level="O2", loss_scale=loss_scale,
+             #                                 master_weights=False if accumulate_gradients else True)
+            model.network, optimizer = amp.initialize(model.network, optimizer, opt_level="O2", keep_batchnorm_fp32=False,
+                                              loss_scale=args.loss_scale)
     else:
         optimizer = BertAdam(optimizer_grouped_parameters,
                              lr=job_config.get_learning_rate(),
                              warmup=job_config.get_warmup_proportion(),
                              t_total=job_config.get_total_training_steps())
 
-    global_step = 0
-    start_epoch = 0
-    
-    # if args.load_training_checkpoint is not None:
-    if load_training_checkpoint != 'False':
-        logger.info(f"Looking for previous training checkpoint.")
-        latest_checkpoint_path = latest_checkpoint_file(parent_dir, no_cuda)
+        #amp._amp_state.loss_scalers[0]._loss_scale = 2 ** 20
 
-        logger.info(f"Restoring previous training checkpoint from {latest_checkpoint_path}")
-        start_epoch, global_step = load_checkpoint(model, optimizer, latest_checkpoint_path)
-        logger.info(f"The model is loaded from last checkpoint at epoch {start_epoch} when the global steps were at {global_step}")
+            global_step = 0
+            start_epoch = 0
 
+            # if args.load_training_checkpoint is not None:
+            if load_training_checkpoint != 'False':
+                logger.info(f"Looking for previous training checkpoint.")
+                latest_checkpoint_path = latest_checkpoint_file(parent_dir, no_cuda)
 
-    logger.info("Training the model")
+                logger.info(f"Restoring previous training checkpoint from {latest_checkpoint_path}")
+                start_epoch, global_step = load_checkpoint(model, optimizer, latest_checkpoint_path)
+                logger.info(f"The model is loaded from last checkpoint at epoch {start_epoch} when the global steps were at {global_step}")
 
-    for index in range(start_epoch, job_config.get_total_epoch_count()):
-        logger.info(f"Training epoch: {index + 1}")
-        
-        train(index)
+            if use_multigpu_with_single_device_per_process:
+                try:
+                    if accumulate_gradients:
+                        logger.info("Enabling gradient accumulation by using a forked version of DistributedDataParallel implementation available in the branch bertonazureml/apex at https://www.github.com/microsoft/apex")
+                        from distributed_apex import DistributedDataParallel as DDP
+                    else:
+                        logger.info("Using Default Apex DistributedDataParallel implementation")
+                        from apex.parallel import DistributedDataParallel as DDP
+                except ImportError:
+                    raise ImportError("To use distributed and fp16 training, please install apex from the branch bertonazureml/apex at https://www.github.com/microsoft/apex.")
+                torch.cuda.set_device(local_rank)
+                model.network = DDP(model.network, delay_allreduce=False)
 
-        if check_write_log():
-            epoch_ckp_path = os.path.join(saved_model_path, "bert_encoder_epoch_{0:04d}.pt".format(index + 1))
-            logger.info(f"Saving checkpoint of the model from epoch {index + 1} at {epoch_ckp_path}")
-            model.save_bert(epoch_ckp_path)
-            checkpoint_model(os.path.join(saved_model_path, "training_state_checkpoint_{0:04d}.tar".format(index + 1)), model, optimizer, index, global_step)
+            elif n_gpu > 1:
+                model.network = nn.DataParallel(model.network)
+
+            logger.info("Training the model")
+
+            for index in range(start_epoch, job_config.get_total_epoch_count()):
+                logger.info(f"Training epoch: {index + 1}")
+
+                train(index)
+
+                if check_write_log():
+                    epoch_ckp_path = os.path.join(saved_model_path, "bert_encoder_epoch_{0:04d}.pt".format(index + 1))
+                    logger.info(f"Saving checkpoint of the model from epoch {index + 1} at {epoch_ckp_path}")
+                    model.save_bert(epoch_ckp_path)
+                    checkpoint_model(os.path.join(saved_model_path, "training_state_checkpoint_{0:04d}.tar".format(index + 1)), model, optimizer, index, global_step)
+
